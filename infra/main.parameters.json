@@ -12,7 +12,13 @@
       "value": "${AZURE_PRINCIPAL_ID}"
     },
     "useAPIM": {
-      "value": "${USE_APIM=false}"
+      "value": "${USE_APIM=true}"
+    },
+    "enableDataStreaming": {
+      "value": "${ENABLE_DATA_STREAMING=true}"
+    },
+    "useADX": {
+      "value": "${USE_ADX=false}"
     }
   }
 }

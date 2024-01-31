@@ -14,6 +14,7 @@ param location string
 //      "value": "myGroupName"
 // }
 param apiServiceName string = ''
+param backendServiceName string = ''
 param applicationInsightsDashboardName string = ''
 param applicationInsightsName string = ''
 param appServicePlanName string = ''
@@ -24,9 +25,18 @@ param logAnalyticsName string = ''
 param resourceGroupName string = ''
 param webServiceName string = ''
 param apimServiceName string = ''
+param managedIdentityName string = ''
+param eventHubNamespaceName string = ''
+param adxClusterName string = ''
 
 @description('Flag to use Azure API Management to mediate the calls between the Web frontend and the backend API')
 param useAPIM bool = false
+
+@description('Flag to enable data streaming')
+param enableDataStreaming bool = false
+
+@description('Flag to use Azure Data Explorer')
+param useADX bool = false
 
 @description('Id of the user or app to assign application roles')
 param principalId string = ''
@@ -84,6 +94,24 @@ module api './app/api.bicep' = {
       AZURE_COSMOS_DATABASE_NAME: cosmos.outputs.databaseName
       AZURE_COSMOS_ENDPOINT: cosmos.outputs.endpoint
       API_ALLOW_ORIGINS: web.outputs.SERVICE_WEB_URI
+    }
+  }
+}
+
+
+// The backend application based on functions
+module backend './app/backend.bicep' = {
+  name: 'backend'
+  scope: rg
+  params: {
+    name: !empty(backendServiceName) ? backendServiceName : '${abbrs.webSitesFunctions}be-${resourceToken}'
+    location: location
+    tags: tags
+    applicationInsightsName: monitoring.outputs.applicationInsightsName
+    appServicePlanId: appServicePlan.outputs.id
+    keyVaultName: keyVault.outputs.name
+    allowedOrigins: [ web.outputs.SERVICE_WEB_URI ]
+    appSettings: {
     }
   }
 }
@@ -184,6 +212,88 @@ module apim './core/gateway/apim.bicep' = if (useAPIM) {
   }
 }
 
+// Configure a user managed identity
+module userManagedIdentity './core/security/user-managed-identity.bicep' = {
+  name: 'msi-deployment'
+  scope: rg
+  params: {
+    location: location
+    name: !empty(managedIdentityName) ? managedIdentityName : '${abbrs.managedIdentityUserAssignedIdentities}${resourceToken}'
+  }
+}
+
+// Configure an Event Hub
+module eventHubRequests './core/messaging/eventhub.bicep' = if (enableDataStreaming) {
+  name: 'eventhub-requests-deployment'
+  scope: rg
+  params: {
+    location: location
+    workspaceId: monitoring.outputs.logAnalyticsWorkspaceId
+    eventHubNamespaceName: !empty(eventHubNamespaceName) ? eventHubNamespaceName : '${abbrs.eventHubNamespaces}${resourceToken}'
+    eventHubName: '${abbrs.eventHubNamespacesEventHubs}${resourceToken}'
+    roleAssignments: [
+      {
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: 'a638d3c7-ab3a-418d-83e6-5f17a39d4fde' // Azure Event Hubs Data Receiver
+        principalId: userManagedIdentity.outputs.properties.principalId
+      }
+    ]
+  }
+}
+
+// Configure Azure Data Explorer
+module adx './core/database/adx/adx.bicep' = if (useADX) {
+  name: 'adx-deployment'
+  scope: rg
+  params: {
+    clusterName: !empty(adxClusterName) ? adxClusterName : '${abbrs.kustoClusters}${resourceToken}'
+    location: location
+    identity: {
+      type: 'UserAssigned'
+      userAssignedIdentities: {
+        '${userManagedIdentity.outputs.resourceId}': {}
+      }
+    }
+    databases: [
+      {
+        name: 'RawEvents'
+        properties: {
+          hotCachePeriod: 'P1D'
+          softDeletePeriod: 'P30D'
+        }
+        scriptsContent: [
+          loadTextContent('app/resources/requests.csl')
+        ]
+      }
+    ]
+  }
+}
+
+module eventHubAdxDataConnection './core/database/adx/adx-data-connection.bicep' = if (enableDataStreaming && useADX) {
+  name: 'dc-eventhub-adx-requests-deployment'
+  scope: rg
+  dependsOn: [
+    adx
+  ]
+  params: {
+    clusterName: adx.outputs.clusterName
+    clusterLocation: location
+    databaseName: 'RawEvents'
+    name: 'dc-eventhub-adx-requests'
+    properties: {
+      compression: 'None'
+      consumerGroup: '$Default'
+      databaseRouting: 'Single'
+      dataFormat: 'MULTIJSON'
+      eventSystemProperties: []
+      eventHubResourceId: eventHubRequests.outputs.eventHubResourceId
+      managedIdentityResourceId: userManagedIdentity.outputs.resourceId
+      mappingRuleName: 'RequestsJsonMapping'
+      tableName: 'Requests'
+    }
+  }
+}
+
 // Configures the API in the Azure API Management (APIM) service
 module apimApi './app/apim-api.bicep' = if (useAPIM) {
   name: 'apim-api-deployment'
@@ -197,6 +307,7 @@ module apimApi './app/apim-api.bicep' = if (useAPIM) {
     webFrontendUrl: web.outputs.SERVICE_WEB_URI
     apiBackendUrl: api.outputs.SERVICE_API_URI
     apiAppName: api.outputs.SERVICE_API_NAME
+    eventhubConnectionString: eventHubRequests.outputs.eventHubConnectionString
   }
 }
 
@@ -214,5 +325,8 @@ output AZURE_TENANT_ID string = tenant().tenantId
 output REACT_APP_API_BASE_URL string = useAPIM ? apimApi.outputs.SERVICE_API_URI : api.outputs.SERVICE_API_URI
 output REACT_APP_APPLICATIONINSIGHTS_CONNECTION_STRING string = monitoring.outputs.applicationInsightsConnectionString
 output REACT_APP_WEB_BASE_URL string = web.outputs.SERVICE_WEB_URI
+output BACKEND_API_ENDPOINT string = backend.outputs.SERVICE_BACKEND_URI
 output USE_APIM bool = useAPIM
+output ENABLE_DATA_STREAMING bool = enableDataStreaming
+output EVENTHUB_CONNECTION_CONNECTION_STRING string =  eventHubRequests.outputs.eventHubConnectionString
 output SERVICE_API_ENDPOINTS array = useAPIM ? [ apimApi.outputs.SERVICE_API_URI, api.outputs.SERVICE_API_URI ]: []
